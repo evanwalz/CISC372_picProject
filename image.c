@@ -3,6 +3,8 @@
 #include <time.h>
 #include <string.h>
 #include "image.h"
+#include <pthread.h>
+#include <stdlib.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -51,22 +53,60 @@ uint8_t getPixelValue(Image* srcImage,int x,int y,int bit,Matrix algorithm){
     return result;
 }
 
-//convolute:  Applies a kernel matrix to an image
-//Parameters: srcImage: The image being convoluted
-//            destImage: A pointer to a  pre-allocated (including space for the pixel array) structure to receive the convoluted image.  It should be the same size as srcImage
-//            algorithm: The kernel matrix to use for the convolution
-//Returns: Nothing
-void convolute(Image* srcImage,Image* destImage,Matrix algorithm){
-    int row,pix,bit,span;
-    span=srcImage->bpp*srcImage->bpp;
-    for (row=0;row<srcImage->height;row++){
-        for (pix=0;pix<srcImage->width;pix++){
-            for (bit=0;bit<srcImage->bpp;bit++){
-                destImage->data[Index(pix,row,srcImage->width,bit,srcImage->bpp)]=getPixelValue(srcImage,pix,row,bit,algorithm);
-            }
-        }
+//so each thread knows what part of image it should work on, one struct per thread. helps avoid race conditions
+typedef struct {
+	Image* src;
+	Image* dest;
+	int y_start;
+	int y_end;
+	int kernel_index;
+} Work;
+
+static void* worker(void* arg) {  //each thread runs this to know to only loop through its own rows
+	Work* w = (Work*)arg;
+	Image* src = w->src;
+	Image* dest = w->dest;
+	int kernel = w->kernel_index;
+
+	for (int row = w->y_start; row < w->y_end; row++){
+        	for (int x = 0; x < src->width; x++){
+            		for (int bit = 0; bit < src->bpp; bit++){
+                		dest->data[Index(x, row, src->width, bit, src->bpp)] =
+                    		getPixelValue(src, x, row, bit, algorithms[kernel]);
+            		}	
+        	}
+    	}	
+    	return NULL;
+}	
+
+// altered to allocate arrays and evenly divide rows among threads.	
+void convolute_thread(Image* src, Image* dst, int kernel_index, int num_threads){
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > src->height) num_threads = src->height;
+
+    pthread_t* threadID = (pthread_t*)malloc(sizeof(pthread_t)*num_threads);
+    Work* jobs = (Work*)malloc(sizeof(Work)*num_threads);
+
+    int height = src->height;
+    for (int t = 0; t < num_threads; t++){
+        int y0 = (t * height) / num_threads;
+        int y1 = ((t + 1) * height) / num_threads;
+
+        jobs[t].src = src;
+        jobs[t].dest = dst;
+        jobs[t].y_start = y0;
+        jobs[t].y_end   = y1;
+        jobs[t].kernel_index = kernel_index;
+
+        pthread_create(&threadID[t], NULL, worker, &jobs[t]);
     }
+    for (int t = 0; t < num_threads; t++){
+        pthread_join(threadID[t], NULL);
+    }
+    free(threadID);
+    free(jobs);
 }
+
 
 //Usage: Prints usage information for the program
 //Returns: -1
@@ -89,34 +129,45 @@ enum KernelTypes GetKernelType(char* type){
 
 //main:
 //argv is expected to take 2 arguments.  First is the source file name (can be jpg, png, bmp, tga).  Second is the lower case name of the algorithm.
-int main(int argc,char** argv){
-    long t1,t2;
-    t1=time(NULL);
+int main(int argc, char** argv){
+    if (argc < 3 || argc > 4) return Usage();
 
-    stbi_set_flip_vertically_on_load(0); 
-    if (argc!=3) return Usage();
-    char* fileName=argv[1];
-    if (!strcmp(argv[1],"pic4.jpg")&&!strcmp(argv[2],"gauss")){
+    char* fileName = argv[1];
+    enum KernelTypes ktype = GetKernelType(argv[2]);
+    int threads = (argc == 4) ? atoi(argv[3]) : 4;
+    if (threads < 1) threads = 1;
+
+    if (!strcmp(argv[1],"pic4.jpg") && !strcmp(argv[2],"gauss")){
         printf("You have applied a gaussian filter to Gauss which has caused a tear in the time-space continum.\n");
     }
-    enum KernelTypes type=GetKernelType(argv[2]);
 
-    Image srcImage,destImage,bwImage;   
-    srcImage.data=stbi_load(fileName,&srcImage.width,&srcImage.height,&srcImage.bpp,0);
-    if (!srcImage.data){
-        printf("Error loading file %s.\n",fileName);
+    Image src, dst;
+    src.data = stbi_load(fileName, &src.width, &src.height, &src.bpp, 0);
+    if (!src.data){
+        printf("Error loading file %s.\n", fileName);
         return -1;
     }
-    destImage.bpp=srcImage.bpp;
-    destImage.height=srcImage.height;
-    destImage.width=srcImage.width;
-    destImage.data=malloc(sizeof(uint8_t)*destImage.width*destImage.bpp*destImage.height);
-    convolute(&srcImage,&destImage,algorithms[type]);
-    stbi_write_png("output.png",destImage.width,destImage.height,destImage.bpp,destImage.data,destImage.bpp*destImage.width);
-    stbi_image_free(srcImage.data);
-    
-    free(destImage.data);
-    t2=time(NULL);
-    printf("Took %ld seconds\n",t2-t1);
-   return 0;
+
+    dst.width = src.width;
+    dst.height = src.height;
+    dst.bpp = src.bpp;
+    size_t nbytes = (size_t)dst.width * dst.height * dst.bpp;
+    dst.data = (uint8_t*)malloc(nbytes);
+    if (!dst.data){
+        printf("Failed to allocate destination image.\n");
+        stbi_image_free(src.data);
+        return -1;
+    }
+
+    long t1 = time(NULL);
+    convolute_thread(&src, &dst, (int)ktype, threads);
+    long t2 = time(NULL);
+
+    stbi_write_png("output.png", dst.width, dst.height, dst.bpp, dst.data, dst.width * dst.bpp);
+
+    stbi_image_free(src.data);
+    free(dst.data);
+
+    printf("Took %ld seconds\n", t2 - t1);
+    return 0;
 }
